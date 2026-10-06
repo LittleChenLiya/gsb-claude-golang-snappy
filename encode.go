@@ -107,7 +107,13 @@ func MaxEncodedLen(srcLen int) int {
 	return int(n)
 }
 
-var errClosed = errors.New("snappy: Writer is closed")
+var (
+	errClosed = errors.New("snappy: Writer is closed")
+
+	// errShortPending is returned when WriteShort is called with new input
+	// while bytes from a previous WriteShort are still waiting to be sent.
+	errShortPending = errors.New("snappy: WriteShort retry is pending; call WriteShort(nil) to finish it")
+)
 
 // NewWriter returns a new Writer that compresses to w.
 //
@@ -157,6 +163,12 @@ type Writer struct {
 	// obuf is a buffer for the outgoing (compressed) bytes.
 	obuf []byte
 
+	// otail holds the encoded bytes from the most recent WriteShort call that
+	// the underlying io.Writer has not yet accepted in full. WriteShort
+	// encodes its input at most once; until otail is drained, retries only
+	// send these remaining bytes. It is nil when nothing is pending.
+	otail []byte
+
 	// wroteStreamHeader is whether we have written the stream header.
 	wroteStreamHeader bool
 }
@@ -169,6 +181,7 @@ func (w *Writer) Reset(writer io.Writer) {
 	if w.ibuf != nil {
 		w.ibuf = w.ibuf[:0]
 	}
+	w.otail = nil
 	w.wroteStreamHeader = false
 }
 
@@ -263,6 +276,125 @@ func (w *Writer) write(p []byte) (nRet int, errRet error) {
 		nRet += len(uncompressed)
 	}
 	return nRet, nil
+}
+
+// ErrNoProgress is returned by WriteShort when the underlying io.Writer
+// accepts zero bytes for some encoded data: retrying immediately would never
+// make progress. The unsent encoded bytes remain in the Writer, and a later
+// WriteShort(nil) call (for example, after the writer becomes writable again)
+// can retry sending them.
+var ErrNoProgress = errors.New("snappy: underlying writer made no progress")
+
+// WriteShort encodes p as one Snappy stream chunk and sends it to the
+// underlying io.Writer, tolerating writers that accept only part of the data
+// in a single Write call.
+//
+// Unlike Write, the input is encoded at most once. If the underlying writer
+// reports a short write (accepting fewer bytes than offered) or another
+// error, the unsent encoded bytes are retained in the Writer. Call
+// WriteShort(nil) to retry sending only those remaining bytes; the chunk
+// header and body are never generated twice. The retained bytes must be
+// drained (WriteShort returns nil error) before WriteShort can encode new
+// input; calling WriteShort with non-empty p while bytes are pending returns
+// an error without touching the pending bytes.
+//
+// The length of p must be no more than maxBlockSize (65536), the largest
+// block permitted by the framing format. Empty p is encoded as a regular,
+// zero-length chunk on the initial call; while a retry is pending, empty p
+// is equivalent to nil and retries the pending bytes.
+//
+// If the underlying writer returns (0, nil) while there are pending bytes,
+// WriteShort returns (0, ErrNoProgress); the pending tail is kept so the
+// caller can retry later. Other write errors are returned as-is, also with
+// the tail retained.
+//
+// WriteShort does not change w.err or the Close state machine. It must not
+// be interleaved with Write, Flush or Close while bytes are pending, since
+// those share the same underlying io.Writer.
+func (w *Writer) WriteShort(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if w.otail != nil {
+		if len(p) != 0 {
+			return 0, errShortPending
+		}
+	} else if len(p) > 0 {
+		if err := w.buildShortFrame(p); err != nil {
+			return 0, err
+		}
+	}
+	if w.otail == nil {
+		// Nothing was pending and there was nothing to encode.
+		return 0, nil
+	}
+	for len(w.otail) > 0 {
+		n, err := w.w.Write(w.otail)
+		if n < 0 || n > len(w.otail) {
+			return 0, io.ErrShortWrite
+		}
+		w.otail = w.otail[n:]
+		if err != nil {
+			if len(w.otail) == 0 {
+				// Everything was accepted; nothing remains to retry.
+				w.otail = nil
+			}
+			return 0, err
+		}
+		if n == 0 {
+			// Retaining the tail means the same data can still be retried
+			// later; report that this attempt made no progress.
+			return 0, ErrNoProgress
+		}
+	}
+	w.otail = nil
+	return len(p), nil
+}
+
+// buildShortFrame encodes p as a single framed chunk and stores the complete
+// frame (stream header on the first call, then chunk header and body) in
+// w.otail. It reuses the same encoding as write but does not send anything.
+func (w *Writer) buildShortFrame(p []byte) error {
+	if len(p) > maxBlockSize {
+		return ErrTooLarge
+	}
+	obufStart := len(magicChunk)
+	if !w.wroteStreamHeader {
+		w.wroteStreamHeader = true
+		copy(w.obuf, magicChunk)
+		obufStart = 0
+	}
+	checksum := crc(p)
+
+	// Compress the buffer, discarding the result if the improvement
+	// isn't at least 12.5%.
+	compressed := Encode(w.obuf[obufHeaderLen:], p)
+	chunkType := uint8(chunkTypeCompressedData)
+	chunkLen := 4 + len(compressed)
+	obufEnd := obufHeaderLen + len(compressed)
+	body := []byte(nil)
+	if len(compressed) >= len(p)-len(p)/8 {
+		chunkType = chunkTypeUncompressedData
+		chunkLen = 4 + len(p)
+		obufEnd = obufHeaderLen
+		body = p
+	}
+
+	// Fill in the per-chunk header that comes before the body.
+	w.obuf[len(magicChunk)+0] = chunkType
+	w.obuf[len(magicChunk)+1] = uint8(chunkLen >> 0)
+	w.obuf[len(magicChunk)+2] = uint8(chunkLen >> 8)
+	w.obuf[len(magicChunk)+3] = uint8(chunkLen >> 16)
+	w.obuf[len(magicChunk)+4] = uint8(checksum >> 0)
+	w.obuf[len(magicChunk)+5] = uint8(checksum >> 8)
+	w.obuf[len(magicChunk)+6] = uint8(checksum >> 16)
+	w.obuf[len(magicChunk)+7] = uint8(checksum >> 24)
+
+	// Join the header (which lives in w.obuf, possibly preceded by the stream
+	// magic) and the body without copying. No further encoding happens until
+	// the tail is drained, so aliasing w.obuf is safe.
+	w.otail = append(w.obuf[obufStart:obufEnd:obufEnd], body...)
+	return nil
 }
 
 // Flush flushes the Writer to its underlying io.Writer.
