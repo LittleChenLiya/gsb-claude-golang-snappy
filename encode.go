@@ -109,6 +109,14 @@ func MaxEncodedLen(srcLen int) int {
 
 var errClosed = errors.New("snappy: Writer is closed")
 
+// ErrNoProgress is returned by Writer.Send when the underlying io.Writer
+// accepts zero bytes (it returns (0, nil)) before all of p has been sent.
+//
+// The encoded bytes for p were generated only once; the unsent tail is
+// retained, so calling Send again (with any p, including nil) retries sending
+// exactly the remaining bytes.
+var ErrNoProgress = errors.New("snappy: underlying writer made no progress")
+
 // NewWriter returns a new Writer that compresses to w.
 //
 // The Writer returned does not buffer writes. There is no need to Flush or
@@ -157,6 +165,16 @@ type Writer struct {
 	// obuf is a buffer for the outgoing (compressed) bytes.
 	obuf []byte
 
+	// pending holds encoded stream bytes from a previous Send that the
+	// underlying io.Writer has not yet accepted in full. It is nil once the
+	// send has completed. The encoded result is generated at most once per
+	// Send; retries only resend pending's remaining bytes.
+	pending []byte
+
+	// pendingOff is the offset, within pending, of the first byte not yet
+	// accepted by the underlying io.Writer.
+	pendingOff int
+
 	// wroteStreamHeader is whether we have written the stream header.
 	wroteStreamHeader bool
 }
@@ -166,6 +184,8 @@ type Writer struct {
 func (w *Writer) Reset(writer io.Writer) {
 	w.w = writer
 	w.err = nil
+	w.pending = nil
+	w.pendingOff = 0
 	if w.ibuf != nil {
 		w.ibuf = w.ibuf[:0]
 	}
@@ -263,6 +283,122 @@ func (w *Writer) write(p []byte) (nRet int, errRet error) {
 		nRet += len(uncompressed)
 	}
 	return nRet, nil
+}
+
+// Send encodes p and sends it to the underlying io.Writer, tolerating short
+// writes. Unlike Write, the encoded result is generated exactly once: bytes
+// that the underlying writer does not accept are retained as an unsent tail,
+// and a subsequent call to Send (p may be nil) resends only those remaining
+// bytes. The stream header is emitted at most once, so a retried Send never
+// duplicates it.
+//
+// If a previous Send was interrupted, its unsent tail is drained before p is
+// encoded; p itself is not encoded until the tail has been fully sent.
+//
+// Send returns ErrNoProgress (without consuming or encoding p) when the
+// underlying writer returns (0, nil). The unsent tail is retained and can
+// still be retried with another Send. Any other write error is reported like
+// in Write: the Writer is put in an error state and the tail is dropped.
+//
+// Send uses the same stream encoding as Write. It is intended for Writers
+// created with NewWriter; it must not be mixed with Write or Flush on a
+// Writer created with NewBufferedWriter.
+func (w *Writer) Send(p []byte) error {
+	if w.err != nil {
+		return w.err
+	}
+	if err := w.drainPending(); err != nil {
+		// ErrNoProgress is not sticky: the unsent tail remains retryable.
+		return err
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	w.pending = w.encodeFrames(p)
+	w.pendingOff = 0
+	return w.drainPending()
+}
+
+// drainPending sends the unsent tail, if any, to the underlying io.Writer,
+// tolerating short writes. A write that returns (0, nil) stops the loop and
+// reports ErrNoProgress while retaining the tail; any other error makes the
+// Writer sticky, as in Write.
+func (w *Writer) drainPending() error {
+	for w.pendingOff < len(w.pending) {
+		n, err := w.w.Write(w.pending[w.pendingOff:])
+		if n < 0 || n > len(w.pending)-w.pendingOff {
+			n = 0
+		}
+		if n > 0 {
+			w.pendingOff += n
+		}
+		if err != nil {
+			w.err = err
+			w.pending = nil
+			w.pendingOff = 0
+			return err
+		}
+		if n == 0 {
+			return ErrNoProgress
+		}
+	}
+	w.pending = nil
+	w.pendingOff = 0
+	return nil
+}
+
+// encodeFrames returns the Snappy stream-framed encoding of p, using the same
+// encoding as (*Writer).write. The stream header is prepended on the first
+// frame. Each block of at most maxBlockSize input bytes produces one chunk.
+func (w *Writer) encodeFrames(p []byte) []byte {
+	headerLen := 0
+	if !w.wroteStreamHeader {
+		headerLen = len(magicChunk)
+		w.wroteStreamHeader = true
+	}
+
+	out := make([]byte, 0, headerLen)
+	if headerLen > 0 {
+		out = append(out, magicChunk...)
+	}
+	for len(p) > 0 {
+		var uncompressed []byte
+		if len(p) > maxBlockSize {
+			uncompressed, p = p[:maxBlockSize], p[maxBlockSize:]
+		} else {
+			uncompressed, p = p, nil
+		}
+		checksum := crc(uncompressed)
+
+		// Compress the buffer, discarding the result if the improvement
+		// isn't at least 12.5%.
+		compressed := Encode(w.obuf[obufHeaderLen:], uncompressed)
+		chunkType := uint8(chunkTypeCompressedData)
+		chunkLen := 4 + len(compressed)
+		obufEnd := obufHeaderLen + len(compressed)
+		if len(compressed) >= len(uncompressed)-len(uncompressed)/8 {
+			chunkType = chunkTypeUncompressedData
+			chunkLen = 4 + len(uncompressed)
+			obufEnd = obufHeaderLen
+		}
+
+		// Fill in the per-chunk header that comes before the body.
+		w.obuf[len(magicChunk)+0] = chunkType
+		w.obuf[len(magicChunk)+1] = uint8(chunkLen >> 0)
+		w.obuf[len(magicChunk)+2] = uint8(chunkLen >> 8)
+		w.obuf[len(magicChunk)+3] = uint8(chunkLen >> 16)
+		w.obuf[len(magicChunk)+4] = uint8(checksum >> 0)
+		w.obuf[len(magicChunk)+5] = uint8(checksum >> 8)
+		w.obuf[len(magicChunk)+6] = uint8(checksum >> 16)
+		w.obuf[len(magicChunk)+7] = uint8(checksum >> 24)
+
+		// The chunk header lives right after the (not emitted) magic bytes.
+		out = append(out, w.obuf[len(magicChunk):obufEnd]...)
+		if chunkType == chunkTypeUncompressedData {
+			out = append(out, uncompressed...)
+		}
+	}
+	return out
 }
 
 // Flush flushes the Writer to its underlying io.Writer.
