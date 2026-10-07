@@ -47,6 +47,35 @@ const (
 	decodeErrCodeUnsupportedLiteralLength = 2
 )
 
+// DecodeOption configures the behavior of DecodeWithOptions.
+//
+// The zero value (a nil function) is not a valid option; use the option
+// constructors provided by this package, such as MaxDecodedLen.
+type DecodeOption func(*decodeConfig)
+
+type decodeConfig struct {
+	// maxDecodedLen is the inclusive upper bound on the declared length of
+	// the decoded block. A negative value means that no bound is imposed.
+	maxDecodedLen int
+}
+
+// MaxDecodedLen returns a DecodeOption that caps the declared length of the
+// decoded block at n, inclusive: a block whose varint length header declares
+// exactly n bytes is accepted.
+//
+// The bound is checked against the block header before the destination
+// buffer is (re)allocated or written, so a block that declares more than n
+// bytes fails with ErrTooLarge without allocating the oversized buffer and
+// without modifying the caller's dst. A malformed length header likewise
+// fails (with ErrCorrupt) before dst is touched.
+//
+// Passing a negative n disables the bound.
+func MaxDecodedLen(n int) DecodeOption {
+	return func(c *decodeConfig) {
+		c.maxDecodedLen = n
+	}
+}
+
 // Decode returns the decoded form of src. The returned slice may be a sub-
 // slice of dst if dst was large enough to hold the entire decoded block.
 // Otherwise, a newly allocated slice will be returned.
@@ -54,10 +83,48 @@ const (
 // The dst and src must not overlap. It is valid to pass a nil dst.
 //
 // Decode handles the Snappy block format, not the Snappy stream format.
+//
+// Decode is equivalent to DecodeWithOptions with no options, and therefore
+// imposes no upper bound on the declared output length.
 func Decode(dst, src []byte) ([]byte, error) {
+	return DecodeWithOptions(dst, src)
+}
+
+// DecodeWithOptions is like Decode but its behavior can be customized with
+// DecodeOptions. When no options are passed it behaves exactly like Decode,
+// so callers that do not opt in to the new checks can keep using the
+// original interface unchanged.
+//
+// The returned slice may be a sub-slice of dst if dst was large enough to
+// hold the entire decoded block; otherwise a newly allocated slice is
+// returned. The dst and src must not overlap. It is valid to pass a nil dst.
+//
+// When a check fails because of the options (for example, MaxDecodedLen),
+// or because the length header is malformed, DecodeWithOptions returns a nil
+// result and does not allocate or otherwise modify the caller's dst.
+//
+// DecodeWithOptions handles the Snappy block format, not the Snappy stream
+// format.
+func DecodeWithOptions(dst, src []byte, opts ...DecodeOption) ([]byte, error) {
+	cfg := decodeConfig{
+		// Negative means "no bound": preserve the original Decode semantics
+		// when the MaxDecodedLen option is not enabled.
+		maxDecodedLen: -1,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	dLen, s, err := decodedLen(src)
 	if err != nil {
+		// The length header is malformed. dst is untouched.
 		return nil, err
+	}
+	if cfg.maxDecodedLen >= 0 && dLen > cfg.maxDecodedLen {
+		// The declared output is larger than the caller is willing to
+		// accept. Check this before allocating or writing dst. A declared
+		// length that equals the bound is allowed.
+		return nil, ErrTooLarge
 	}
 	if dLen <= len(dst) {
 		dst = dst[:dLen]
