@@ -84,6 +84,70 @@ func NewReader(r io.Reader) *Reader {
 	}
 }
 
+// FrameEventType identifies the kind of a stream frame observed by a
+// FrameObserver.
+type FrameEventType int
+
+const (
+	// FrameEventCompressed is a compressed data chunk (chunk type 0x00).
+	FrameEventCompressed FrameEventType = iota
+	// FrameEventUncompressed is an uncompressed data chunk (chunk type 0x01).
+	FrameEventUncompressed
+	// FrameEventSkippable is a padding chunk (chunk type 0xfe) or a reserved
+	// skippable chunk (chunk types 0x80-0xfd).
+	FrameEventSkippable
+)
+
+// String returns a human-readable name for the frame event type.
+func (t FrameEventType) String() string {
+	switch t {
+	case FrameEventCompressed:
+		return "compressed"
+	case FrameEventUncompressed:
+		return "uncompressed"
+	case FrameEventSkippable:
+		return "skippable"
+	}
+	return "unknown"
+}
+
+// FrameEvent describes a single stream frame observed by a Reader while
+// decoding. Events are delivered in wire order.
+type FrameEvent struct {
+	// Seq is the zero-based sequence number of the frame, counting data and
+	// skippable frames. The stream identifier chunk is not counted. A frame
+	// that fails checksum verification keeps its sequence number.
+	Seq int
+	// Type classifies the frame as compressed data, uncompressed data or
+	// skippable.
+	Type FrameEventType
+	// VerifiedBytes is the cumulative number of decoded output bytes from
+	// data frames whose checksum verified successfully, including this
+	// frame if it is one of them. Skippable frames and frames that fail
+	// verification do not contribute to this total.
+	VerifiedBytes int64
+	// Decoded is a snapshot copy of the frame's decoded payload for data
+	// frames, and nil for skippable frames. It is a private copy made for
+	// the observer: mutating it does not affect the Reader's internal
+	// buffers or the bytes returned by Read.
+	Decoded []byte
+	// Err is non-nil if the frame failed checksum verification, in which
+	// case the Reader will report the same error from Read.
+	Err error
+}
+
+// FrameObserver receives a FrameEvent for every data or skippable frame a
+// Reader processes, including frames that fail checksum verification.
+type FrameObserver interface {
+	ObserveFrame(FrameEvent)
+}
+
+// FrameObserverFunc adapts an ordinary function to a FrameObserver.
+type FrameObserverFunc func(FrameEvent)
+
+// ObserveFrame calls f(e).
+func (f FrameObserverFunc) ObserveFrame(e FrameEvent) { f(e) }
+
 // Reader is an io.Reader that can read Snappy-compressed bytes.
 //
 // Reader handles the Snappy stream format, not the Snappy block format.
@@ -95,6 +159,41 @@ type Reader struct {
 	// decoded[i:j] contains decoded bytes that have not yet been passed on.
 	i, j       int
 	readHeader bool
+
+	// observer, if non-nil, is notified of every data or skippable frame.
+	observer FrameObserver
+	// frameSeq is the sequence number of the next observed frame.
+	frameSeq int
+	// verified is the cumulative decoded size of verified data frames.
+	verified int64
+}
+
+// SetFrameObserver registers obs to receive a FrameEvent for every data or
+// skippable frame the Reader processes. Passing nil disables observation.
+// The observer is retained across Reset calls.
+func (r *Reader) SetFrameObserver(obs FrameObserver) {
+	r.observer = obs
+}
+
+// observeFrame notifies the observer, if any, of a single frame. The decoded
+// payload is copied so the observer never sees a mutable internal buffer.
+func (r *Reader) observeFrame(typ FrameEventType, decoded []byte, err error) {
+	r.frameSeq++
+	if r.observer == nil {
+		return
+	}
+	var snapshot []byte
+	if decoded != nil {
+		snapshot = make([]byte, len(decoded))
+		copy(snapshot, decoded)
+	}
+	r.observer.ObserveFrame(FrameEvent{
+		Seq:           r.frameSeq - 1,
+		Type:          typ,
+		VerifiedBytes: r.verified,
+		Decoded:       snapshot,
+		Err:           err,
+	})
 }
 
 // Reset discards any buffered data, resets all state, and switches the Snappy
@@ -106,6 +205,8 @@ func (r *Reader) Reset(reader io.Reader) {
 	r.i = 0
 	r.j = 0
 	r.readHeader = false
+	r.frameSeq = 0
+	r.verified = 0
 }
 
 func (r *Reader) readFull(p []byte, allowEOF bool) (ok bool) {
@@ -167,9 +268,12 @@ func (r *Reader) fill() error {
 				return r.err
 			}
 			if crc(r.decoded[:n]) != checksum {
+				r.observeFrame(FrameEventCompressed, r.decoded[:n], ErrCorrupt)
 				r.err = ErrCorrupt
 				return r.err
 			}
+			r.verified += int64(n)
+			r.observeFrame(FrameEventCompressed, r.decoded[:n], nil)
 			r.i, r.j = 0, n
 			continue
 
@@ -194,9 +298,12 @@ func (r *Reader) fill() error {
 				return r.err
 			}
 			if crc(r.decoded[:n]) != checksum {
+				r.observeFrame(FrameEventUncompressed, r.decoded[:n], ErrCorrupt)
 				r.err = ErrCorrupt
 				return r.err
 			}
+			r.verified += int64(n)
+			r.observeFrame(FrameEventUncompressed, r.decoded[:n], nil)
 			r.i, r.j = 0, n
 			continue
 
@@ -228,6 +335,7 @@ func (r *Reader) fill() error {
 		if !r.readFull(r.buf[:chunkLen], false) {
 			return r.err
 		}
+		r.observeFrame(FrameEventSkippable, nil, nil)
 	}
 
 	return nil
