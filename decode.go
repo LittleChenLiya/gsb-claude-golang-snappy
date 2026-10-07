@@ -95,6 +95,14 @@ type Reader struct {
 	// decoded[i:j] contains decoded bytes that have not yet been passed on.
 	i, j       int
 	readHeader bool
+
+	// observer, if non-nil, is notified about framing-format chunks as they
+	// are verified. frameNo counts observed chunks (data and skippable, not
+	// the stream identifier), and observedTotal is the running total of the
+	// payloads of verified data chunks.
+	observer      FrameObserver
+	frameNo       int
+	observedTotal int64
 }
 
 // Reset discards any buffered data, resets all state, and switches the Snappy
@@ -106,6 +114,8 @@ func (r *Reader) Reset(reader io.Reader) {
 	r.i = 0
 	r.j = 0
 	r.readHeader = false
+	r.frameNo = 0
+	r.observedTotal = 0
 }
 
 func (r *Reader) readFull(p []byte, allowEOF bool) (ok bool) {
@@ -167,9 +177,12 @@ func (r *Reader) fill() error {
 				return r.err
 			}
 			if crc(r.decoded[:n]) != checksum {
+				r.observe(FrameCompressedData, n, nil, true)
 				r.err = ErrCorrupt
 				return r.err
 			}
+			r.observedTotal += int64(n)
+			r.observe(FrameCompressedData, n, r.decoded[:n], false)
 			r.i, r.j = 0, n
 			continue
 
@@ -194,9 +207,12 @@ func (r *Reader) fill() error {
 				return r.err
 			}
 			if crc(r.decoded[:n]) != checksum {
+				r.observe(FrameUncompressedData, n, nil, true)
 				r.err = ErrCorrupt
 				return r.err
 			}
+			r.observedTotal += int64(n)
+			r.observe(FrameUncompressedData, n, r.decoded[:n], false)
 			r.i, r.j = 0, n
 			continue
 
@@ -228,6 +244,7 @@ func (r *Reader) fill() error {
 		if !r.readFull(r.buf[:chunkLen], false) {
 			return r.err
 		}
+		r.observe(FrameSkippable, 0, nil, false)
 	}
 
 	return nil
