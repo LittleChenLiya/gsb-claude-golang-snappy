@@ -55,9 +55,62 @@ const (
 //
 // Decode handles the Snappy block format, not the Snappy stream format.
 func Decode(dst, src []byte) ([]byte, error) {
+	return DecodeWithOptions(dst, src)
+}
+
+// DecodeOption configures the behavior of DecodeWithOptions.
+type DecodeOption func(*decodeOptions)
+
+type decodeOptions struct {
+	// maxOutputLen is the maximum accepted decoded length, but it is only
+	// consulted when limitOutput is true (so that the zero value of
+	// maxOutputLen does not accidentally mean "limit to zero bytes").
+	maxOutputLen int
+	limitOutput  bool
+}
+
+// WithMaxOutputLen returns a DecodeOption that caps the decoded output.
+//
+// The cap is checked against the uncompressed length declared in src's block
+// header, before any destination buffer is allocated or written. A declared
+// length larger than n makes DecodeWithOptions return ErrTooLarge without
+// modifying dst; a declared length equal to n is accepted.
+//
+// A zero n permits only the empty block; a negative n rejects every block,
+// including the empty block.
+func WithMaxOutputLen(n int) DecodeOption {
+	return func(o *decodeOptions) {
+		o.limitOutput = true
+		o.maxOutputLen = n
+	}
+}
+
+// DecodeWithOptions is like Decode but accepts DecodeOption values such as
+// WithMaxOutputLen. With no options, or without WithMaxOutputLen, it behaves
+// exactly like Decode.
+//
+// The length header of src is validated before dst is reused or a new buffer
+// is allocated: a malformed varint yields ErrCorrupt and a declared decoded
+// length exceeding the configured cap yields ErrTooLarge, and in both cases
+// the caller's dst is left untouched (its length, capacity and contents are
+// preserved).
+//
+// The dst and src must not overlap. It is valid to pass a nil dst.
+//
+// DecodeWithOptions handles the Snappy block format, not the Snappy stream
+// format.
+func DecodeWithOptions(dst, src []byte, opts ...DecodeOption) ([]byte, error) {
+	var o decodeOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	dLen, s, err := decodedLen(src)
 	if err != nil {
 		return nil, err
+	}
+	if o.limitOutput && dLen > o.maxOutputLen {
+		return nil, ErrTooLarge
 	}
 	if dLen <= len(dst) {
 		dst = dst[:dLen]
